@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ProxyMan - Multi-Proxy & DNS Supervisor</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body class="dark-theme">
+  <div id="app" class="app-layout">
+    <!-- Navigation / Header -->
+    <header class="navbar">
+      <div class="nav-brand">
+        <div class="brand-logo">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
+        </div>
+        <div class="brand-info">
+          <h1>ProxyMan</h1>
+          <span class="version-tag">v0.1.0</span>
+        </div>
+      </div>
+
+      <div class="nav-stats">
+        <div class="stat-pill">
+          <span class="stat-label">Total Services</span>
+          <span class="stat-value" id="stat-total">0</span>
+        </div>
+        <div class="stat-pill">
+          <span class="stat-dot dot-running"></span>
+          <span class="stat-label">Running</span>
+          <span class="stat-value text-success" id="stat-running">0</span>
+        </div>
+        <div class="stat-pill">
+          <span class="stat-dot dot-stopped"></span>
+          <span class="stat-label">Stopped</span>
+          <span class="stat-value text-muted" id="stat-stopped">0</span>
+        </div>
+        <div class="stat-pill">
+          <span class="stat-dot dot-alert"></span>
+          <span class="stat-label">Alerts</span>
+          <span class="stat-value text-danger" id="stat-alerts">0</span>
+        </div>
+      </div>
+
+      <div class="nav-actions">
+        <button id="btn-start-all" class="btn btn-secondary" title="Start all services">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Start All
+        </button>
+        <button id="btn-stop-all" class="btn btn-secondary" title="Stop all services">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+          Stop All
+        </button>
+        <button id="btn-add-service" class="btn btn-primary" title="Add a new proxy or DNS service">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Service
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Content Container -->
+    <main class="main-container">
+      <div class="toolbar">
+        <div class="search-box">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="service-search" placeholder="Search services by name, type, port..." />
+        </div>
+        <div class="filter-group">
+          <button class="filter-chip active" data-filter="all">All</button>
+          <button class="filter-chip" data-filter="overtls">overtls</button>
+          <button class="filter-chip" data-filter="clean-dns">clean-dns</button>
+          <button class="filter-chip" data-filter="gost">gost</button>
+          <button class="filter-chip" data-filter="custom">custom</button>
+        </div>
+      </div>
+
+      <!-- Services Grid -->
+      <div id="services-grid" class="services-grid">
+        <!-- Dynamic Cards Injected Here -->
+      </div>
+
+      <!-- Empty State -->
+      <div id="empty-state" class="empty-state hidden">
+        <div class="empty-icon">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+            <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+            <line x1="6" y1="6" x2="6.01" y2="6"></line>
+            <line x1="6" y1="18" x2="6.01" y2="18"></line>
+          </svg>
+        </div>
+        <h3>No Proxy Services Configured</h3>
+        <p>Start managing your overtls, clean-dns, and gost proxy services with automated health recovery.</p>
+        <button class="btn btn-primary" onclick="openAddModal()">Add Your First Service</button>
+      </div>
+    </main>
+
+    <!-- Service Modal (Add / Edit) -->
+    <div id="service-modal" class="modal-backdrop hidden">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h2 id="modal-title">Configure Service</h2>
+          <button class="modal-close" onclick="closeServiceModal()">&times;</button>
+        </div>
+
+        <form id="service-form" onsubmit="handleServiceSubmit(event)">
+          <input type="hidden" id="form-is-edit" value="false" />
+
+          <!-- Type Selector -->
+          <div class="form-section">
+            <label class="section-label">Service Driver</label>
+            <div class="driver-cards">
+              <label class="driver-card">
+                <input type="radio" name="driver_type" value="overtls" checked onchange="switchDriverFields('overtls')" />
+                <div class="driver-box">
+                  <span class="driver-title">overtls</span>
+                  <span class="driver-desc">SOCKS5 Proxy Tunnel</span>
+                </div>
+              </label>
+              <label class="driver-card">
+                <input type="radio" name="driver_type" value="overtls-chain" onchange="switchDriverFields('overtls-chain')" />
+                <div class="driver-box">
+                  <span class="driver-title">overtls-chain</span>
+                  <span class="driver-desc">Multi-hop Chain</span>
+                </div>
+              </label>
+              <label class="driver-card">
+                <input type="radio" name="driver_type" value="clean-dns" onchange="switchDriverFields('clean-dns')" />
+                <div class="driver-box">
+                  <span class="driver-title">clean-dns</span>
+                  <span class="driver-desc">Anti-Pollution DNS</span>
+                </div>
+              </label>
+              <label class="driver-card">
+                <input type="radio" name="driver_type" value="gost" onchange="switchDriverFields('gost')" />
+                <div class="driver-box">
+                  <span class="driver-title">gost</span>
+                  <span class="driver-desc">HTTP/SOCKS Tunnel</span>
+                </div>
+              </label>
+              <label class="driver-card">
+                <input type="radio" name="driver_type" value="custom" onchange="switchDriverFields('custom')" />
+                <div class="driver-box">
+                  <span class="driver-title">custom</span>
+                  <span class="driver-desc">Custom Executable</span>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- General Details -->
+          <div class="form-grid">
+            <div class="form-group">
+              <label for="form-id">Service ID *</label>
+              <input type="text" id="form-id" required placeholder="e.g. overtls-hk" pattern="^[a-zA-Z0-9_\-]+$" />
+              <span class="field-hint">Unique alphanumeric slug</span>
+            </div>
+            <div class="form-group">
+              <label for="form-name">Display Name *</label>
+              <input type="text" id="form-name" required placeholder="e.g. Hong Kong Node 1" />
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <div class="form-group">
+              <label for="form-listen-host">Listen Host</label>
+              <input type="text" id="form-listen-host" value="127.0.0.1" required />
+            </div>
+            <div class="form-group">
+              <label for="form-listen-port">Listen Port *</label>
+              <input type="number" id="form-listen-port" required min="1" max="65535" placeholder="1080" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="form-bin-path">Binary Path</label>
+            <input type="text" id="form-bin-path" placeholder="e.g. /opt/homebrew/bin/overtls" spellcheck="false" />
+            <span class="field-hint">Leave empty to auto-detect from PATH (overtls, overtls-chain, clean-dns, gost)</span>
+          </div>
+
+          <!-- Driver Specific Settings -->
+          <div id="fields-overtls" class="driver-fields">
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="form-overtls-host">Server Host / IP *</label>
+                <input type="text" id="form-overtls-host" placeholder="154.12.33.144 or mynode.com" />
+              </div>
+              <div class="form-group">
+                <label for="form-overtls-port">Server Port</label>
+                <input type="number" id="form-overtls-port" value="443" />
+              </div>
+            </div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="form-overtls-password">Password / Key</label>
+                <input type="text" id="form-overtls-password" placeholder="Tunnel password" />
+              </div>
+              <div class="form-group">
+                <label for="form-overtls-path">Tunnel Path</label>
+                <input type="text" id="form-overtls-path" value="/secret-tunnel-path/" />
+              </div>
+            </div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="form-overtls-client-id">Client ID (UUID)</label>
+                <input type="text" id="form-overtls-client-id" placeholder="Optional UUID" />
+              </div>
+              <div class="form-group">
+                <label for="form-overtls-domain">Server SNI Domain</label>
+                <input type="text" id="form-overtls-domain" placeholder="Optional SNI hostname" />
+              </div>
+            </div>
+          </div>
+
+          <div id="fields-clean-dns" class="driver-fields hidden">
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="form-dns-bind">DNS Bind Address</label>
+                <input type="text" id="form-dns-bind" value="127.0.0.1:5353" />
+                <span class="field-hint">UDP listen address, e.g. 127.0.0.1:5353</span>
+              </div>
+              <div class="form-group">
+                <label for="form-dns-api">Clean-DNS API Port</label>
+                <input type="number" id="form-dns-api" value="3002" />
+                <span class="field-hint">HTTP API port, independent of the DNS bind port</span>
+              </div>
+            </div>
+            <div class="form-note" role="note">
+              DNS Bind Address and Clean-DNS API Port override <code>bind</code> and <code>api_port</code> in the config file. ProxyMan writes a runtime copy and does not edit your YAML. Plugins, routing, and relative files still load from the config file directory. Port 53 requires root on macOS.
+            </div>
+            <div class="form-group">
+              <label for="form-dns-config">Config File Path</label>
+              <input type="text" id="form-dns-config" placeholder="e.g. /Users/zhanghu/vpn/clean-dns/config.yaml" spellcheck="false" />
+              <span class="field-hint">Plugin/routing YAML. Leave empty to generate a default config.yaml</span>
+            </div>
+          </div>
+
+          <div id="fields-gost" class="driver-fields hidden">
+            <div class="form-group">
+              <label for="form-gost-listen">Listen Spec</label>
+              <input type="text" id="form-gost-listen" placeholder="e.g. http://:8080 or socks5://:1080" />
+            </div>
+            <div class="form-group">
+              <label for="form-gost-forward">Forward Spec (Chain)</label>
+              <input type="text" id="form-gost-forward" placeholder="e.g. socks5://127.0.0.1:1080" />
+            </div>
+          </div>
+
+          <div id="fields-custom" class="driver-fields hidden">
+            <div class="form-group">
+              <label for="form-custom-cmd">Command / Executable</label>
+              <input type="text" id="form-custom-cmd" placeholder="e.g. /usr/local/bin/sing-box" />
+            </div>
+            <div class="form-group">
+              <label for="form-custom-args">Arguments (space separated)</label>
+              <input type="text" id="form-custom-args" placeholder="run -c /path/to/config.json" />
+            </div>
+          </div>
+
+          <!-- Supervisor & Health Watchdog Options -->
+          <div class="form-section expandable">
+            <label class="section-label">Supervisor & Watchdog Policy</label>
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="form-restart-policy">Restart Policy</label>
+                <select id="form-restart-policy">
+                  <option value="on_failure">On Failure (Recommended)</option>
+                  <option value="always">Always (Keep Alive)</option>
+                  <option value="never">Never (Manual Only)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="form-probe-type">Health Check Probe</label>
+                <select id="form-probe-type">
+                  <option value="socks5">SOCKS5 Handshake</option>
+                  <option value="http">HTTP Proxy Probe</option>
+                  <option value="dns">DNS Query</option>
+                  <option value="tcp">TCP Connect</option>
+                  <option value="none">None</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeServiceModal()">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-save-service">Save Service</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Live Logs Modal -->
+    <div id="logs-modal" class="modal-backdrop hidden">
+      <div class="modal-card modal-card-large">
+        <div class="modal-header">
+          <div class="header-with-badge">
+            <h2 id="logs-title">Service Logs</h2>
+            <span class="badge" id="logs-service-badge">overtls</span>
+            <span class="live-dot" title="Live WebSocket Stream"></span>
+          </div>
+          <div class="logs-header-actions">
+            <button class="btn btn-sm btn-secondary" onclick="clearLogsViewer()">Clear</button>
+            <label class="autoscroll-toggle">
+              <input type="checkbox" id="autoscroll-chk" checked />
+              <span>Auto-scroll</span>
+            </label>
+            <button class="modal-close" onclick="closeLogsModal()">&times;</button>
+          </div>
+        </div>
+        <div class="logs-terminal" id="logs-terminal">
+          <!-- Real-time log stream lines here -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
