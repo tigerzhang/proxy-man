@@ -154,6 +154,20 @@ struct AddArgs {
     )]
     restart: String,
 
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Max restart retries (0 = unlimited / loop restart with delay)"
+    )]
+    max_restarts: u32,
+
+    #[arg(
+        long,
+        default_value_t = 2,
+        help = "Restart delay / backoff in seconds"
+    )]
+    restart_delay: u64,
+
     // Type-specific arguments
     #[arg(long, help = "Remote server host (for overtls/overtls-chain)")]
     server_host: Option<String>,
@@ -626,8 +640,8 @@ async fn handle_add(client: &reqwest::Client, api_url: &str, args: AddArgs) -> R
         bin_path: args.bin_path,
         work_dir: None,
         restart_policy,
-        max_restart_retries: 5,
-        restart_backoff_secs: 2,
+        max_restart_retries: args.max_restarts,
+        restart_backoff_secs: args.restart_delay,
         health_check: HealthCheckConfig::default(),
         env_vars: std::collections::HashMap::new(),
         settings,

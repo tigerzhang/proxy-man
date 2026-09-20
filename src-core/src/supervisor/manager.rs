@@ -205,6 +205,7 @@ impl ServiceManager {
             state.pid = None;
             state.uptime_secs = None;
             state.latency_ms = None;
+            state.restart_count = 0;
             let _ = self.event_sender.send(state.clone());
         }
 
@@ -327,6 +328,184 @@ impl ServiceManager {
         Ok(probe_res)
     }
 
+    pub async fn trigger_auto_restart(
+        &self,
+        id: &str,
+        exit_status: Option<i32>,
+        error_msg: Option<String>,
+    ) {
+        let instance = match self.store.get(id).await {
+            Some(inst) => inst,
+            None => return,
+        };
+
+        if !instance.enabled {
+            return;
+        }
+
+        let should_restart = match instance.restart_policy {
+            RestartPolicy::Always => true,
+            RestartPolicy::OnFailure => exit_status != Some(0),
+            RestartPolicy::Never => false,
+        };
+
+        let is_infinite_loop =
+            instance.restart_policy == RestartPolicy::Always || instance.max_restart_retries == 0;
+
+        let mut states = self.states.write().await;
+        let state = states.entry(id.to_string()).or_insert_with(|| ServiceRuntimeState {
+            id: id.to_string(),
+            status: RuntimeStatus::Crashed,
+            pid: None,
+            uptime_secs: None,
+            restart_count: 0,
+            last_restart_time: None,
+            last_exit_code: exit_status,
+            last_error: error_msg.clone(),
+            latency_ms: None,
+            last_probe_time: None,
+            memory_bytes: None,
+        });
+
+        state.last_exit_code = exit_status;
+        state.pid = None;
+        state.uptime_secs = None;
+        state.latency_ms = None;
+        if let Some(ref err) = error_msg {
+            state.last_error = Some(err.clone());
+        }
+
+        let can_retry =
+            should_restart && (is_infinite_loop || state.restart_count < instance.max_restart_retries);
+
+        if can_retry {
+            state.restart_count = state.restart_count.saturating_add(1);
+            state.last_restart_time = Some(Utc::now());
+            state.status = RuntimeStatus::BackoffWaiting;
+            let _ = self.event_sender.send(state.clone());
+
+            let base_delay = if instance.restart_backoff_secs == 0 {
+                2
+            } else {
+                instance.restart_backoff_secs
+            };
+            let max_delay = base_delay.max(60);
+            let backoff_secs = (base_delay
+                * (1 << (state.restart_count.saturating_sub(1)).min(5)))
+            .min(max_delay);
+
+            if is_infinite_loop {
+                warn!(
+                    "Service '{}' will restart in {}s (attempt {}, loop restart with delay)",
+                    id, backoff_secs, state.restart_count
+                );
+            } else {
+                warn!(
+                    "Service '{}' will restart in {}s (attempt {}/{})",
+                    id, backoff_secs, state.restart_count, instance.max_restart_retries
+                );
+            }
+            drop(states);
+
+            let self_clone = Arc::new(self.clone());
+            let inst_id = id.to_string();
+            tokio::spawn(async move {
+                let mut current_delay = backoff_secs;
+                loop {
+                    sleep(Duration::from_secs(current_delay)).await;
+
+                    // Abort if service was manually stopped or disabled
+                    let instance = match self_clone.store.get(&inst_id).await {
+                        Some(inst) if inst.enabled => inst,
+                        _ => return,
+                    };
+                    {
+                        let states = self_clone.states.read().await;
+                        if let Some(s) = states.get(&inst_id) {
+                            if s.status == RuntimeStatus::Stopped {
+                                return;
+                            }
+                        }
+                    }
+
+                    match self_clone.start_service(&inst_id).await {
+                        Ok(()) => {
+                            info!("Auto-restart of service '{}' succeeded", inst_id);
+                            return;
+                        }
+                        Err(e) => {
+                            error!("Failed to auto-restart service '{}': {}", inst_id, e);
+                            let is_infinite_loop = instance.restart_policy == RestartPolicy::Always
+                                || instance.max_restart_retries == 0;
+
+                            let mut states = self_clone.states.write().await;
+                            let state = states.entry(inst_id.clone()).or_insert_with(|| ServiceRuntimeState {
+                                id: inst_id.clone(),
+                                status: RuntimeStatus::Crashed,
+                                pid: None,
+                                uptime_secs: None,
+                                restart_count: 0,
+                                last_restart_time: None,
+                                last_exit_code: None,
+                                last_error: Some(format!("Auto-restart failed: {}", e)),
+                                latency_ms: None,
+                                last_probe_time: None,
+                                memory_bytes: None,
+                            });
+
+                            state.last_error = Some(format!("Auto-restart failed: {}", e));
+
+                            let can_retry = is_infinite_loop || state.restart_count < instance.max_restart_retries;
+                            if can_retry {
+                                state.restart_count = state.restart_count.saturating_add(1);
+                                state.last_restart_time = Some(Utc::now());
+                                state.status = RuntimeStatus::BackoffWaiting;
+                                let _ = self_clone.event_sender.send(state.clone());
+
+                                let base_delay = if instance.restart_backoff_secs == 0 {
+                                    2
+                                } else {
+                                    instance.restart_backoff_secs
+                                };
+                                let max_delay = base_delay.max(60);
+                                current_delay = (base_delay
+                                    * (1 << (state.restart_count.saturating_sub(1)).min(5)))
+                                .min(max_delay);
+
+                                if is_infinite_loop {
+                                    warn!(
+                                        "Service '{}' will retry restart in {}s (attempt {}, loop restart with delay)",
+                                        inst_id, current_delay, state.restart_count
+                                    );
+                                } else {
+                                    warn!(
+                                        "Service '{}' will retry restart in {}s (attempt {}/{})",
+                                        inst_id, current_delay, state.restart_count, instance.max_restart_retries
+                                    );
+                                }
+                            } else {
+                                state.status = RuntimeStatus::Crashed;
+                                warn!(
+                                    "Service '{}' exceeded max restarts or restart policy is Never",
+                                    inst_id
+                                );
+                                let _ = self_clone.event_sender.send(state.clone());
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        } else {
+            state.status = RuntimeStatus::Crashed;
+            warn!(
+                "Service '{}' exceeded max restarts or restart policy is Never",
+                id
+            );
+            let _ = self.event_sender.send(state.clone());
+        }
+    }
+
     pub fn start_watchdog(self: Arc<Self>) {
         tokio::spawn(async move {
             info!("Starting ProxyMan supervisor watchdog loop");
@@ -376,63 +555,12 @@ impl ServiceManager {
                             warn!("Failed to clear persisted runtime for '{}': {}", id, err);
                         }
 
-                        let mut states = self.states.write().await;
-                        let state = states.entry(id.clone()).or_insert_with(|| ServiceRuntimeState {
-                            id: id.clone(),
-                            status: RuntimeStatus::Crashed,
-                            pid: None,
-                            uptime_secs: None,
-                            restart_count: 0,
-                            last_restart_time: None,
-                            last_exit_code: exit_status,
-                            last_error: Some("Process terminated unexpectedly".to_string()),
-                            latency_ms: None,
-                            last_probe_time: None,
-                            memory_bytes: None,
-                        });
-
-                        state.last_exit_code = exit_status;
-                        state.pid = None;
-                        state.uptime_secs = None;
-                        state.latency_ms = None;
-
-                        // Check restart policy
-                        let should_restart = match instance.restart_policy {
-                            RestartPolicy::Always => true,
-                            RestartPolicy::OnFailure => exit_status != Some(0),
-                            RestartPolicy::Never => false,
-                        };
-
-                        if should_restart && state.restart_count < instance.max_restart_retries {
-                            state.restart_count += 1;
-                            state.last_restart_time = Some(Utc::now());
-                            state.status = RuntimeStatus::BackoffWaiting;
-                            let _ = self.event_sender.send(state.clone());
-
-                            let backoff_secs = (instance.restart_backoff_secs
-                                * (1 << (state.restart_count - 1).min(5)))
-                            .min(60);
-                            warn!(
-                                "Service '{}' will restart in {}s (attempt {}/{})",
-                                id, backoff_secs, state.restart_count, instance.max_restart_retries
-                            );
-
-                            let self_clone = Arc::clone(&self);
-                            let inst_id = id.clone();
-                            tokio::spawn(async move {
-                                sleep(Duration::from_secs(backoff_secs)).await;
-                                if let Err(e) = self_clone.start_service(&inst_id).await {
-                                    error!("Failed to auto-restart service '{}': {}", inst_id, e);
-                                }
-                            });
-                        } else {
-                            state.status = RuntimeStatus::Crashed;
-                            warn!(
-                                "Service '{}' exceeded max restarts or restart policy is Never",
-                                id
-                            );
-                            let _ = self.event_sender.send(state.clone());
-                        }
+                        self.trigger_auto_restart(
+                            &id,
+                            exit_status,
+                            Some("Process terminated unexpectedly".to_string()),
+                        )
+                        .await;
                     } else if let Some(pid) = pid_opt {
                         // 2. Process is running: update memory & uptime
                         let mut states = self.states.write().await;
@@ -441,7 +569,12 @@ impl ServiceManager {
                             let sysinfo_pid = Pid::from_u32(pid);
                             if let Some(proc) = system.process(sysinfo_pid) {
                                 state.memory_bytes = Some(proc.memory());
-                                state.uptime_secs = Some(proc.run_time());
+                                let run_time = proc.run_time();
+                                state.uptime_secs = Some(run_time);
+                                // Reset restart count once running stably for at least 30s
+                                if run_time >= 30 && state.restart_count > 0 {
+                                    state.restart_count = 0;
+                                }
                             }
                         }
                         drop(states);
@@ -467,6 +600,9 @@ impl ServiceManager {
                                     state.latency_ms = Some(probe_res.latency_ms);
                                     *fail_count = 0;
                                     state.status = RuntimeStatus::Running;
+                                    if state.restart_count > 0 {
+                                        state.restart_count = 0;
+                                    }
                                 } else {
                                     *fail_count += 1;
                                     warn!(
@@ -478,9 +614,12 @@ impl ServiceManager {
                                         state.last_error = probe_res.error.clone();
 
                                         // Restart degraded service if policy allows
-                                        if instance.restart_policy != RestartPolicy::Never
-                                            && state.restart_count < instance.max_restart_retries
-                                        {
+                                        let is_infinite_loop = instance.restart_policy == RestartPolicy::Always
+                                            || instance.max_restart_retries == 0;
+                                        let can_retry = instance.restart_policy != RestartPolicy::Never
+                                            && (is_infinite_loop || state.restart_count < instance.max_restart_retries);
+
+                                        if can_retry {
                                             warn!(
                                                 "Service '{}' is degraded; triggering auto-restart",
                                                 id

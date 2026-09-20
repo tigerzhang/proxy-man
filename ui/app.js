@@ -172,7 +172,7 @@ function renderServiceCard(s) {
           </div>
           <div class="metric-item">
             <span class="metric-label">Restarts</span>
-            <div class="metric-value">${s.runtime.restart_count}</div>
+            <div class="metric-value">${(s.max_restart_retries === 0 || s.restart_policy === 'always') ? `${s.runtime.restart_count} (loop)` : `${s.runtime.restart_count}/${s.max_restart_retries != null ? s.max_restart_retries : 5}`}</div>
           </div>
         </div>
       </div>
@@ -276,6 +276,8 @@ function openAddModal() {
   document.getElementById('form-id').disabled = false;
   document.querySelector('input[name="driver_type"][value="overtls"]').checked = true;
   switchDriverFields('overtls');
+  document.getElementById('form-max-retries').value = '0';
+  document.getElementById('form-restart-delay').value = '2';
   document.getElementById('service-modal').classList.remove('hidden');
 }
 
@@ -322,6 +324,8 @@ function openEditModal(id) {
 
   document.getElementById('form-restart-policy').value = service.restart_policy || 'on_failure';
   document.getElementById('form-probe-type').value = service.health_check ? service.health_check.probe_type : 'socks5';
+  document.getElementById('form-max-retries').value = service.max_restart_retries != null ? service.max_restart_retries : 0;
+  document.getElementById('form-restart-delay').value = service.restart_backoff_secs != null ? service.restart_backoff_secs : 2;
 
   document.getElementById('service-modal').classList.remove('hidden');
 }
@@ -444,6 +448,11 @@ async function handleServiceSubmit(e) {
     };
   }
 
+  const parsedMaxRetries = parseInt(document.getElementById('form-max-retries').value, 10);
+  const parsedDelay = parseInt(document.getElementById('form-restart-delay').value, 10);
+  const max_restart_retries = isNaN(parsedMaxRetries) ? 0 : Math.max(0, parsedMaxRetries);
+  const restart_backoff_secs = isNaN(parsedDelay) ? 2 : Math.max(1, parsedDelay);
+
   const payload = {
     id,
     name,
@@ -454,8 +463,8 @@ async function handleServiceSubmit(e) {
     bin_path,
     work_dir: existing ? existing.work_dir : null,
     restart_policy,
-    max_restart_retries: existing && existing.max_restart_retries != null ? existing.max_restart_retries : 5,
-    restart_backoff_secs: existing && existing.restart_backoff_secs != null ? existing.restart_backoff_secs : 2,
+    max_restart_retries,
+    restart_backoff_secs,
     health_check: {
       enabled: probe_type !== 'none',
       check_interval_secs: existing && existing.health_check ? existing.health_check.check_interval_secs : 10,

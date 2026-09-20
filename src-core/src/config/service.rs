@@ -215,6 +215,8 @@ pub struct ServiceInstance {
     pub work_dir: Option<String>,
     #[serde(default)]
     pub restart_policy: RestartPolicy,
+    /// Maximum restart retries before giving up.
+    /// A value of `0` means unlimited / loop restart indefinitely with delay.
     #[serde(default = "default_max_restart_retries")]
     pub max_restart_retries: u32,
     #[serde(default = "default_restart_backoff")]
@@ -265,8 +267,9 @@ fn default_localhost() -> String {
     "127.0.0.1".to_string()
 }
 
+/// Defaults to 0 (unlimited loop restart with delay)
 fn default_max_restart_retries() -> u32 {
-    5
+    0
 }
 
 fn default_restart_backoff() -> u64 {

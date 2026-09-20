@@ -270,7 +270,7 @@
                 <label for="form-restart-policy">Restart Policy</label>
                 <select id="form-restart-policy">
                   <option value="on_failure">On Failure (Recommended)</option>
-                  <option value="always">Always (Keep Alive)</option>
+                  <option value="always">Always (Keep Alive / Loop)</option>
                   <option value="never">Never (Manual Only)</option>
                 </select>
               </div>
@@ -283,6 +283,18 @@
                   <option value="tcp">TCP Connect</option>
                   <option value="none">None</option>
                 </select>
+              </div>
+            </div>
+            <div class="form-grid" style="margin-top: 0.8rem;">
+              <div class="form-group">
+                <label for="form-max-retries">Max Restart Retries</label>
+                <input type="number" id="form-max-retries" min="0" value="0" />
+                <span class="field-hint">0 = unlimited loop restart with delay</span>
+              </div>
+              <div class="form-group">
+                <label for="form-restart-delay">Restart Delay (seconds)</label>
+                <input type="number" id="form-restart-delay" min="1" value="2" />
+                <span class="field-hint">Initial delay (exponential backoff up to 60s)</span>
               </div>
             </div>
           </div>

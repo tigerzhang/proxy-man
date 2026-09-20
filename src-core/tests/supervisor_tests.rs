@@ -475,3 +475,84 @@ async fn test_start_refuses_foreign_listener() {
         "expected port-busy error, got: {err}"
     );
 }
+
+#[tokio::test]
+async fn test_loop_restart_with_zero_max_retries() {
+    let temp = tempdir().unwrap();
+    let store = ConfigStore::new(Some(temp.path().to_path_buf())).unwrap();
+
+    let mut instance = sleep_instance("loop-svc", 61990);
+    instance.restart_policy = RestartPolicy::OnFailure;
+    instance.max_restart_retries = 0; // 0 = unlimited loop restart
+    instance.restart_backoff_secs = 1;
+    store.add(instance).await.unwrap();
+
+    let mgr = ServiceManager::new(store);
+
+    // Call trigger_auto_restart when restart_count is already high
+    {
+        let mut states = mgr.get_state("loop-svc").await;
+        states.restart_count = 10;
+        // manually put it in state
+        let _ = mgr.trigger_auto_restart("loop-svc", Some(1), Some("test error".to_string())).await;
+    }
+
+    let state = mgr.get_state("loop-svc").await;
+    assert_eq!(state.status, RuntimeStatus::BackoffWaiting);
+    assert_eq!(state.restart_count, 1); // was 0 initially in store state, incremented to 1
+}
+
+#[tokio::test]
+async fn test_restart_policy_always_loops_indefinitely() {
+    let temp = tempdir().unwrap();
+    let store = ConfigStore::new(Some(temp.path().to_path_buf())).unwrap();
+
+    let mut instance = sleep_instance("always-svc", 61991);
+    instance.restart_policy = RestartPolicy::Always;
+    instance.max_restart_retries = 3; // Even with 3, Always keeps looping
+    instance.restart_backoff_secs = 1;
+    store.add(instance).await.unwrap();
+
+    let mgr = ServiceManager::new(store);
+
+    // Simulate 3 failures
+    for _ in 0..5 {
+        mgr.trigger_auto_restart("always-svc", Some(1), Some("crash".to_string())).await;
+    }
+
+    let state = mgr.get_state("always-svc").await;
+    assert_eq!(state.status, RuntimeStatus::BackoffWaiting);
+    assert_eq!(state.restart_count, 5);
+}
+
+#[tokio::test]
+async fn test_restart_policy_on_failure_respects_max_retries() {
+    let temp = tempdir().unwrap();
+    let store = ConfigStore::new(Some(temp.path().to_path_buf())).unwrap();
+
+    let mut instance = sleep_instance("limited-svc", 61992);
+    instance.restart_policy = RestartPolicy::OnFailure;
+    instance.max_restart_retries = 2; // Limited retries
+    instance.restart_backoff_secs = 1;
+    store.add(instance).await.unwrap();
+
+    let mgr = ServiceManager::new(store);
+
+    // 1st retry
+    mgr.trigger_auto_restart("limited-svc", Some(1), None).await;
+    let s1 = mgr.get_state("limited-svc").await;
+    assert_eq!(s1.status, RuntimeStatus::BackoffWaiting);
+    assert_eq!(s1.restart_count, 1);
+
+    // 2nd retry
+    mgr.trigger_auto_restart("limited-svc", Some(1), None).await;
+    let s2 = mgr.get_state("limited-svc").await;
+    assert_eq!(s2.status, RuntimeStatus::BackoffWaiting);
+    assert_eq!(s2.restart_count, 2);
+
+    // 3rd failure exceeds max retries
+    mgr.trigger_auto_restart("limited-svc", Some(1), None).await;
+    let s3 = mgr.get_state("limited-svc").await;
+    assert_eq!(s3.status, RuntimeStatus::Crashed);
+}
+
