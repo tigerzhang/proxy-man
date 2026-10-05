@@ -155,4 +155,69 @@ plugins:
             test_target: Some("one.one.one.one".to_string()),
         }
     }
+
+    fn get_target_ports(&self, instance: &ServiceInstance, config_dir: &Path) -> Vec<super::TargetPort> {
+        use crate::config::parse_host_port;
+        let mut ports = Vec::new();
+        let config_file = config_dir.join("config.yaml");
+        let (bind, api_port) = if config_file.is_file() {
+            if let Ok(content) = fs::read_to_string(&config_file) {
+                if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                    let bind = yaml.get("bind").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let api_port = yaml.get("api_port").and_then(|v| v.as_u64()).map(|p| p as u16);
+                    (bind, api_port)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        let bind_str = bind.unwrap_or_else(|| {
+            if let ServiceSettings::CleanDns(ref s) = instance.settings {
+                effective_bind(instance, s)
+            } else {
+                format!("{}:{}", instance.listen_host, instance.listen_port)
+            }
+        });
+
+        if let Some((host, port)) = parse_host_port(&bind_str) {
+            if port > 0 {
+                // DNS service listens on UDP and TCP
+                ports.push(super::TargetPort {
+                    host: host.clone(),
+                    port,
+                    is_udp: false,
+                });
+                ports.push(super::TargetPort {
+                    host,
+                    port,
+                    is_udp: true,
+                });
+            }
+        }
+
+        let api_p = api_port.or_else(|| {
+            if let ServiceSettings::CleanDns(ref s) = instance.settings {
+                Some(s.api_port)
+            } else {
+                None
+            }
+        });
+
+        if let Some(port) = api_p {
+            if port > 0 {
+                ports.push(super::TargetPort {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    is_udp: false,
+                });
+            }
+        }
+
+        ports
+    }
 }

@@ -476,6 +476,117 @@ async fn test_start_refuses_foreign_listener() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_overtls_refuses_foreign_port_from_config_file() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    if find_listening_pids("127.0.0.1", port).is_empty() {
+        eprintln!("skip: lsof did not report the test listener on port {port}");
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let store = ConfigStore::new(Some(temp.path().to_path_buf())).unwrap();
+
+    let instance = ServiceInstance {
+        id: "test-overtls-busy".to_string(),
+        name: "Test Overtls Busy".to_string(),
+        service_type: ServiceType::Overtls,
+        enabled: true,
+        listen_host: "127.0.0.1".to_string(),
+        listen_port: port,
+        bin_path: Some("/bin/sleep".to_string()),
+        work_dir: None,
+        restart_policy: RestartPolicy::Never,
+        max_restart_retries: 0,
+        restart_backoff_secs: 1,
+        health_check: HealthCheckConfig::default(),
+        env_vars: std::collections::HashMap::new(),
+        settings: ServiceSettings::Overtls(OvertlsSettings {
+            remarks: "Test".to_string(),
+            server_host: "1.2.3.4".to_string(),
+            server_port: 443,
+            password: "test".to_string(),
+            tunnel_path: "/test/".to_string(),
+            client_id: None,
+            server_domain: None,
+            disable_tls: false,
+            cafile: None,
+            raw_json: None,
+            method: "none".to_string(),
+        }),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    store.add(instance).await.unwrap();
+    let mgr = ServiceManager::new(store);
+    let err = mgr
+        .start_service("test-overtls-busy")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("already in use") && err.contains("configuration file"),
+        "expected config file target port busy error, got: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_clean_dns_refuses_foreign_api_port_from_config_file() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_port = listener.local_addr().unwrap().port();
+    if find_listening_pids("127.0.0.1", api_port).is_empty() {
+        eprintln!("skip: lsof did not report the test listener on port {api_port}");
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let store = ConfigStore::new(Some(temp.path().to_path_buf())).unwrap();
+
+    let instance = ServiceInstance {
+        id: "test-clean-dns-busy".to_string(),
+        name: "Test Clean DNS Busy".to_string(),
+        service_type: ServiceType::CleanDns,
+        enabled: true,
+        listen_host: "127.0.0.1".to_string(),
+        listen_port: 61988,
+        bin_path: Some("/bin/sleep".to_string()),
+        work_dir: None,
+        restart_policy: RestartPolicy::Never,
+        max_restart_retries: 0,
+        restart_backoff_secs: 1,
+        health_check: HealthCheckConfig::default(),
+        env_vars: std::collections::HashMap::new(),
+        settings: ServiceSettings::CleanDns(CleanDnsSettings {
+            bind: "127.0.0.1:61988".to_string(),
+            api_port,
+            upstream_dns: vec!["8.8.8.8".to_string()],
+            socks5_proxy: None,
+            config_path: None,
+            raw_yaml: None,
+        }),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    store.add(instance).await.unwrap();
+    let mgr = ServiceManager::new(store);
+    let err = mgr
+        .start_service("test-clean-dns-busy")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("already in use") && err.contains("configuration file"),
+        "expected config file target port busy error, got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn test_loop_restart_with_zero_max_retries() {
     let temp = tempdir().unwrap();

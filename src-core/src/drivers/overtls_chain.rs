@@ -79,4 +79,43 @@ impl ServiceDriver for OvertlsChainDriver {
             test_target: None,
         }
     }
+
+    fn get_target_ports(&self, instance: &ServiceInstance, config_dir: &Path) -> Vec<super::TargetPort> {
+        let config_file = config_dir.join("chain_config.json");
+        if config_file.is_file() {
+            if let Ok(content) = fs::read_to_string(&config_file) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(client_settings) = json.get("client_settings") {
+                        let host = client_settings
+                            .get("listen_host")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&instance.listen_host)
+                            .to_string();
+                        let port = client_settings
+                            .get("listen_port")
+                            .and_then(|v| v.as_u64())
+                            .map(|p| p as u16)
+                            .unwrap_or(instance.listen_port);
+                        if port > 0 {
+                            return vec![super::TargetPort {
+                                host,
+                                port,
+                                is_udp: false,
+                            }];
+                        }
+                    }
+                }
+            }
+        }
+
+        if instance.listen_port > 0 {
+            vec![super::TargetPort {
+                host: instance.listen_host.clone(),
+                port: instance.listen_port,
+                is_udp: false,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
 }

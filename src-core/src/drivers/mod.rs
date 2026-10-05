@@ -10,10 +10,28 @@ use std::env;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetPort {
+    pub host: String,
+    pub port: u16,
+    pub is_udp: bool,
+}
+
 pub trait ServiceDriver: Send + Sync {
     fn prepare_config(&self, instance: &ServiceInstance, config_dir: &Path) -> Result<()>;
     fn build_command(&self, instance: &ServiceInstance, config_dir: &Path) -> Result<Command>;
     fn default_health_check(&self, instance: &ServiceInstance) -> HealthCheckConfig;
+    fn get_target_ports(&self, instance: &ServiceInstance, _config_dir: &Path) -> Vec<TargetPort> {
+        if instance.listen_port > 0 {
+            vec![TargetPort {
+                host: instance.listen_host.clone(),
+                port: instance.listen_port,
+                is_udp: false,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 pub fn get_driver(service_type: ServiceType) -> Box<dyn ServiceDriver> {

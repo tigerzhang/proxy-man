@@ -158,12 +158,32 @@ async fn start_service(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    state
-        .manager
-        .start_service(&id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({ "success": true })))
+    match state.manager.start_service(&id).await {
+        Ok(outcome) => {
+            let adopted = matches!(outcome, crate::supervisor::StartOutcome::Adopted { .. });
+            let message = match &outcome {
+                crate::supervisor::StartOutcome::Adopted { pid, host, port, is_udp, .. } => {
+                    format!(
+                        "Adopted leftover process PID {pid} listening on {host}:{port} ({})",
+                        if *is_udp { "UDP" } else { "TCP" }
+                    )
+                }
+                crate::supervisor::StartOutcome::Spawned { pid } => {
+                    format!("Started service '{id}' successfully (PID {pid})")
+                }
+                crate::supervisor::StartOutcome::AlreadyRunning { pid } => {
+                    format!("Service '{id}' is already running (PID {pid})")
+                }
+            };
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "adopted": adopted,
+                "outcome": outcome,
+                "message": message,
+            })))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 }
 
 async fn stop_service(
@@ -182,12 +202,32 @@ async fn restart_service(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    state
-        .manager
-        .restart_service(&id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({ "success": true })))
+    match state.manager.restart_service(&id).await {
+        Ok(outcome) => {
+            let adopted = matches!(outcome, crate::supervisor::StartOutcome::Adopted { .. });
+            let message = match &outcome {
+                crate::supervisor::StartOutcome::Adopted { pid, host, port, is_udp, .. } => {
+                    format!(
+                        "Adopted leftover process PID {pid} listening on {host}:{port} ({})",
+                        if *is_udp { "UDP" } else { "TCP" }
+                    )
+                }
+                crate::supervisor::StartOutcome::Spawned { pid } => {
+                    format!("Restarted service '{id}' successfully (PID {pid})")
+                }
+                crate::supervisor::StartOutcome::AlreadyRunning { pid } => {
+                    format!("Service '{id}' is already running (PID {pid})")
+                }
+            };
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "adopted": adopted,
+                "outcome": outcome,
+                "message": message,
+            })))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 }
 
 async fn probe_service(

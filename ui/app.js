@@ -4,6 +4,8 @@ let allServices = [];
 let activeFilter = 'all';
 let logSocket = null;
 let eventSocket = null;
+const serviceErrors = {};
+const serviceAdopted = {};
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -177,6 +179,8 @@ function renderServiceCard(s) {
         </div>
       </div>
 
+      ${renderCardAlert(s)}
+
       <div class="card-actions">
         <label class="switch" title="Toggle Service Power">
           <input type="checkbox" ${isRunning ? 'checked' : ''} onchange="toggleServicePower('${s.id}', this.checked)" />
@@ -202,27 +206,335 @@ function renderServiceCard(s) {
   `;
 }
 
+// Helpers for conflict & adoption parsing
+function parseConflictMessage(text) {
+  if (!text) return null;
+  const detailedMatch = text.match(/Target port\s+([^ ]+)\s*(?:\(([^)]+)\))?\s*from configuration file is already in use by PID\s*(\d+)(?:\s*\(([^)]+)\))?(?:\s*—\s*not adopting(?:\s*\(executable does not match\s*([^)]+)\))?)?/i);
+  if (detailedMatch) {
+    return {
+      portStr: detailedMatch[1],
+      protocol: detailedMatch[2] || 'TCP',
+      pid: detailedMatch[3],
+      holderExe: detailedMatch[4] || '',
+      expectedExe: detailedMatch[5] || '',
+      raw: text
+    };
+  }
+  const genericMatch = text.match(/(?:Address already in use|port\s*([0-9]+)\s*already in use)/i);
+  if (genericMatch) {
+    return {
+      portStr: genericMatch[1] || 'Occupied',
+      protocol: 'TCP',
+      pid: null,
+      holderExe: '',
+      expectedExe: '',
+      raw: text
+    };
+  }
+  return null;
+}
+
+function parseAdoptedMessage(text) {
+  if (!text) return null;
+  const match = text.match(/Leftover process PID\s*(\d+)(?:\s*\(([^)]+)\))?\s*adopted successfully/i);
+  if (match) {
+    return {
+      pid: match[1],
+      exe: match[2] || '',
+      raw: text
+    };
+  }
+  return null;
+}
+
+function copyKillCmd(pid, btn) {
+  const cmd = `kill -9 ${pid}`;
+  navigator.clipboard.writeText(cmd).then(() => {
+    const origHtml = btn.innerHTML;
+    btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Copied!`;
+    btn.style.borderColor = '#10b981';
+    btn.style.color = '#34d399';
+    setTimeout(() => {
+      btn.innerHTML = origHtml;
+      btn.style.borderColor = '';
+      btn.style.color = '';
+    }, 2000);
+  }).catch(() => {
+    prompt('Copy command to kill process:', cmd);
+  });
+}
+
+function dismissCardAlert(id) {
+  delete serviceErrors[id];
+  delete serviceAdopted[id];
+  renderServices();
+}
+
+function renderCardAlert(s) {
+  if (serviceErrors[s.id]) {
+    const errData = serviceErrors[s.id];
+    const parsed = parseConflictMessage(errData.message);
+    if (parsed && parsed.pid) {
+      return `
+        <div class="card-alert-banner banner-error">
+          <div class="banner-top">
+            <span class="banner-badge">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              Port Conflict Alert
+            </span>
+            <button class="banner-dismiss" onclick="dismissCardAlert('${s.id}')" title="Dismiss Alert">&times;</button>
+          </div>
+          <div class="conflict-meta-box" style="margin: 0.2rem 0;">
+            <div class="meta-row">
+              <span class="meta-lbl">Target Port</span>
+              <span class="meta-val highlight-port">${parsed.portStr} (${parsed.protocol})</span>
+            </div>
+            <div class="meta-row">
+              <span class="meta-lbl">Occupying PID</span>
+              <span class="meta-val highlight-pid">${parsed.pid}</span>
+            </div>
+            ${parsed.holderExe ? `
+            <div class="meta-row">
+              <span class="meta-lbl">Active Binary</span>
+              <span class="meta-val highlight-foreign">${escapeHtml(parsed.holderExe)}</span>
+            </div>` : ''}
+          </div>
+          <div class="banner-actions">
+            <button class="toast-btn toast-btn-danger" onclick="copyKillCmd('${parsed.pid}', this)">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+              Copy 'kill -9 ${parsed.pid}'
+            </button>
+            <button class="toast-btn toast-btn-outline" onclick="openEditModal('${s.id}')">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              Edit Config
+            </button>
+          </div>
+        </div>
+      `;
+    } else {
+      return `
+        <div class="card-alert-banner banner-error">
+          <div class="banner-top">
+            <span class="banner-badge">Start Error</span>
+            <button class="banner-dismiss" onclick="dismissCardAlert('${s.id}')" title="Dismiss Alert">&times;</button>
+          </div>
+          <div class="banner-body">${escapeHtml(errData.message)}</div>
+        </div>
+      `;
+    }
+  }
+
+  if (serviceAdopted[s.id]) {
+    const adoptData = serviceAdopted[s.id];
+    const parsed = parseAdoptedMessage(adoptData.message);
+    return `
+      <div class="card-alert-banner banner-info">
+        <div class="banner-top">
+          <span class="banner-badge">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+            Process Adopted
+          </span>
+          <button class="banner-dismiss" onclick="dismissCardAlert('${s.id}')" title="Dismiss Alert">&times;</button>
+        </div>
+        ${parsed && parsed.pid ? `
+          <div class="adopted-meta-box" style="margin: 0.2rem 0;">
+            <div class="meta-row">
+              <span class="meta-lbl">Adopted PID</span>
+              <span class="meta-val highlight-pid">${parsed.pid}</span>
+            </div>
+            ${parsed.exe ? `
+            <div class="meta-row">
+              <span class="meta-lbl">Executable</span>
+              <span class="meta-val" style="color: #34d399;">${escapeHtml(parsed.exe)}</span>
+            </div>` : ''}
+            <div class="adopted-status-note">
+              Reconnected and adopted existing process without service disruption.
+            </div>
+          </div>
+        ` : `
+          <div class="banner-body">${escapeHtml(adoptData.message)}</div>
+        `}
+      </div>
+    `;
+  }
+  return '';
+}
+
+// Toast Notifications
+function showStylefulToast(type, title, message, serviceId = null, extra = null, duration = null) {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+
+  const iconMap = {
+    info: 'ℹ️',
+    error: '✖',
+    success: '✔',
+  };
+  const icon = iconMap[type] || '🔔';
+
+  const conflict = (type === 'error') ? parseConflictMessage(message) : null;
+  const adopted = (type === 'info' || (extra && extra.adopted)) ? parseAdoptedMessage(message) : null;
+
+  let bodyHtml = '';
+  if (conflict && conflict.pid) {
+    bodyHtml = `
+      <div class="toast-message" style="margin-bottom: 0.5rem;">Target port is blocked by an unadoptable process.</div>
+      <div class="conflict-meta-box">
+        <div class="meta-row">
+          <span class="meta-lbl">Target Port</span>
+          <span class="meta-val highlight-port">${conflict.portStr} (${conflict.protocol})</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-lbl">Occupying PID</span>
+          <span class="meta-val highlight-pid">${conflict.pid}</span>
+        </div>
+        ${conflict.holderExe ? `
+        <div class="meta-row">
+          <span class="meta-lbl">Active Binary</span>
+          <span class="meta-val highlight-foreign">${escapeHtml(conflict.holderExe)}</span>
+        </div>` : ''}
+        ${conflict.expectedExe ? `
+        <div class="meta-row">
+          <span class="meta-lbl">Expected Exe</span>
+          <span class="meta-val meta-muted">${escapeHtml(conflict.expectedExe)}</span>
+        </div>` : ''}
+      </div>
+      <div class="toast-actions-bar">
+        <button class="toast-btn toast-btn-danger" onclick="copyKillCmd('${conflict.pid}', this)">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          Copy 'kill -9 ${conflict.pid}'
+        </button>
+        ${serviceId ? `
+        <button class="toast-btn toast-btn-outline" onclick="openEditModal('${serviceId}')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          Change Port
+        </button>` : ''}
+      </div>
+    `;
+    if (duration === null) duration = 10000;
+  } else if (adopted && adopted.pid) {
+    bodyHtml = `
+      <div class="adopted-meta-box">
+        <div class="meta-row">
+          <span class="meta-lbl">Adopted PID</span>
+          <span class="meta-val highlight-pid">${adopted.pid}</span>
+        </div>
+        ${adopted.exe ? `
+        <div class="meta-row">
+          <span class="meta-lbl">Binary</span>
+          <span class="meta-val" style="color: #34d399;">${escapeHtml(adopted.exe)}</span>
+        </div>` : ''}
+        <div class="adopted-status-note">
+          Matching process was running on target port and has been cleanly adopted.
+        </div>
+      </div>
+    `;
+    if (duration === null) duration = 7000;
+  } else {
+    bodyHtml = `
+      <div class="toast-message">${escapeHtml(message)}</div>
+    `;
+    if (duration === null) duration = type === 'error' ? 8000 : 5000;
+  }
+
+  toast.innerHTML = `
+    <div class="toast-header">
+      <div class="toast-title-group">
+        <div class="toast-icon">${icon}</div>
+        <div class="toast-title">${escapeHtml(title)}</div>
+        ${serviceId ? `<span class="toast-tag">${escapeHtml(serviceId)}</span>` : ''}
+      </div>
+      <button class="toast-close" title="Dismiss">&times;</button>
+    </div>
+    <div class="toast-body">${bodyHtml}</div>
+  `;
+
+  const closeBtn = toast.querySelector('.toast-close');
+  const dismiss = () => {
+    toast.classList.add('toast-hiding');
+    setTimeout(() => toast.remove(), 250);
+  };
+  closeBtn.addEventListener('click', dismiss);
+
+  container.appendChild(toast);
+  if (duration > 0) {
+    setTimeout(dismiss, duration);
+  }
+}
+
 // Service Actions
 async function toggleServicePower(id, enable) {
   const endpoint = enable ? `/api/services/${id}/start` : `/api/services/${id}/stop`;
   try {
     const res = await fetch(endpoint, { method: 'POST' });
-    if (!res.ok) {
-      const err = await res.text();
-      alert(`Action failed: ${err}`);
-      loadServices();
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
     }
+
+    if (!res.ok) {
+      const err = (data && (data.error || data.message)) || text || 'Unknown error';
+      serviceErrors[id] = { message: err };
+      delete serviceAdopted[id];
+      showStylefulToast('error', `Start Refused: ${id}`, err, id);
+    } else {
+      if (data && data.adopted) {
+        delete serviceErrors[id];
+        serviceAdopted[id] = { message: data.message || `Adopted existing process successfully.` };
+        showStylefulToast('info', `Leftover Process Adopted: ${id}`, data.message || `Adopted existing process successfully.`, id, data);
+      } else {
+        delete serviceErrors[id];
+        delete serviceAdopted[id];
+        showStylefulToast('success', `Service ${enable ? 'Started' : 'Stopped'}`, `Service '${id}' is now ${enable ? 'running' : 'stopped'}.`);
+      }
+    }
+    loadServices();
   } catch (err) {
     console.error('Action failed', err);
+    serviceErrors[id] = { message: err.message || String(err) };
+    showStylefulToast('error', `Action Failed: ${id}`, err.message || String(err), id);
     loadServices();
   }
 }
 
 async function restartService(id) {
   try {
-    await fetch(`/api/services/${id}/restart`, { method: 'POST' });
+    const res = await fetch(`/api/services/${id}/restart`, { method: 'POST' });
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+
+    if (!res.ok) {
+      const err = (data && (data.error || data.message)) || text || 'Unknown error';
+      serviceErrors[id] = { message: err };
+      delete serviceAdopted[id];
+      showStylefulToast('error', `Restart Refused: ${id}`, err, id);
+    } else {
+      if (data && data.adopted) {
+        delete serviceErrors[id];
+        serviceAdopted[id] = { message: data.message || `Adopted existing process successfully.` };
+        showStylefulToast('info', `Leftover Process Adopted: ${id}`, data.message || `Adopted existing process successfully.`, id, data);
+      } else {
+        delete serviceErrors[id];
+        delete serviceAdopted[id];
+        showStylefulToast('success', `Service Restarted`, `Service '${id}' was restarted.`);
+      }
+    }
+    loadServices();
   } catch (err) {
     console.error('Restart failed', err);
+    serviceErrors[id] = { message: err.message || String(err) };
+    showStylefulToast('error', `Restart Failed: ${id}`, err.message || String(err), id);
   }
 }
 
@@ -231,12 +543,12 @@ async function probeService(id) {
     const res = await fetch(`/api/services/${id}/probe`, { method: 'POST' });
     const data = await res.json();
     if (data.success) {
-      console.log(`Probe for ${id} returned: ${data.latency_ms}ms`);
+      showStylefulToast('success', `Probe Result: ${id}`, `Latency: ${data.latency_ms} ms`);
     } else {
-      alert(`Probe failed: ${data.error}`);
+      showStylefulToast('error', `Probe Failed: ${id}`, data.error || 'Connection probe timed out', id);
     }
   } catch (err) {
-    alert(`Probe request failed: ${err}`);
+    showStylefulToast('error', `Probe Request Error: ${id}`, err.message || String(err), id);
   }
 }
 
@@ -246,23 +558,48 @@ async function deleteService(id) {
     const res = await fetch(`/api/services/${id}`, { method: 'DELETE' });
     if (res.ok) {
       allServices = allServices.filter(s => s.id !== id);
+      delete serviceErrors[id];
+      delete serviceAdopted[id];
       renderServices();
       updateStats();
+      showStylefulToast('success', 'Service Deleted', `Service '${id}' has been removed.`);
     }
   } catch (err) {
     console.error('Delete failed', err);
+    showStylefulToast('error', 'Delete Failed', err.message || String(err));
   }
 }
 
 async function startAllServices() {
   for (const s of allServices) {
-    await fetch(`/api/services/${s.id}/start`, { method: 'POST' });
+    try {
+      const res = await fetch(`/api/services/${s.id}/start`, { method: 'POST' });
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+      if (!res.ok) {
+        const err = (data && (data.error || data.message)) || text || 'Unknown error';
+        serviceErrors[s.id] = { message: err };
+        delete serviceAdopted[s.id];
+        showStylefulToast('error', `Start Refused: ${s.id}`, err, s.id);
+      } else if (data && data.adopted) {
+        delete serviceErrors[s.id];
+        serviceAdopted[s.id] = { message: data.message };
+        showStylefulToast('info', `Leftover Process Adopted: ${s.id}`, data.message, s.id, data);
+      } else {
+        delete serviceErrors[s.id];
+      }
+    } catch (e) {
+      console.error(e);
+    }
   }
   loadServices();
 }
 
 async function stopAllServices() {
   for (const s of allServices) {
+    delete serviceErrors[s.id];
+    delete serviceAdopted[s.id];
     await fetch(`/api/services/${s.id}/stop`, { method: 'POST' });
   }
   loadServices();
@@ -492,12 +829,13 @@ async function handleServiceSubmit(e) {
     if (res.ok) {
       closeServiceModal();
       loadServices();
+      showStylefulToast('success', isEdit ? 'Service Updated' : 'Service Created', `Configuration for '${id}' has been saved.`);
     } else {
       const err = await res.text();
-      alert(`Save failed: ${err}`);
+      showStylefulToast('error', 'Save Failed', err, id);
     }
   } catch (err) {
-    alert(`Request error: ${err}`);
+    showStylefulToast('error', 'Request Error', err.message || String(err), id);
   }
 }
 

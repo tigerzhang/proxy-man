@@ -427,19 +427,36 @@ async fn handle_start(client: &reqwest::Client, api_url: &str, id: &str) -> Resu
         for s in services {
             println!("Starting {}...", s.instance.id.cyan());
             let url = format!("{}/api/services/{}/start", api_url, s.instance.id);
-            let _ = client.post(&url).send().await;
+            if let Ok(resp) = client.post(&url).send().await {
+                if resp.status().is_success() {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if body.get("adopted").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        print_adopted_banner(&s.instance.id, &body);
+                    } else {
+                        println!("{} Service '{}' started.", "✓".green().bold(), s.instance.id.cyan());
+                    }
+                } else if let Ok(err_text) = resp.text().await {
+                    print_conflict_error_banner(&s.instance.id, &err_text);
+                }
+            }
         }
-        println!("{}", "All services started.".green().bold());
+        println!("{}", "Start all operation completed.".green().bold());
         return Ok(());
     }
 
     let url = format!("{}/api/services/{}/start", api_url, id);
     let resp = client.post(&url).send().await.context("Failed to connect to daemon")?;
     if resp.status().is_success() {
-        println!("{} Service '{}' started successfully.", "✓".green().bold(), id.cyan());
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if body.get("adopted").and_then(|v| v.as_bool()).unwrap_or(false) {
+            print_adopted_banner(id, &body);
+        } else {
+            let msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("started successfully");
+            println!("{} Service '{}': {}", "✓".green().bold(), id.cyan(), msg.green());
+        }
     } else {
         let err_text = resp.text().await?;
-        eprintln!("{} Failed to start service: {}", "✗".red().bold(), err_text);
+        print_conflict_error_banner(id, &err_text);
     }
     Ok(())
 }
@@ -475,7 +492,18 @@ async fn handle_restart(client: &reqwest::Client, api_url: &str, id: &str) -> Re
         for s in services {
             println!("Restarting {}...", s.instance.id.cyan());
             let url = format!("{}/api/services/{}/restart", api_url, s.instance.id);
-            let _ = client.post(&url).send().await;
+            if let Ok(resp) = client.post(&url).send().await {
+                if resp.status().is_success() {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if body.get("adopted").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        print_adopted_banner(&s.instance.id, &body);
+                    } else {
+                        println!("{} Service '{}' restarted.", "✓".green().bold(), s.instance.id.cyan());
+                    }
+                } else if let Ok(err_text) = resp.text().await {
+                    print_conflict_error_banner(&s.instance.id, &err_text);
+                }
+            }
         }
         println!("{}", "All services restarted.".green().bold());
         return Ok(());
@@ -484,12 +512,75 @@ async fn handle_restart(client: &reqwest::Client, api_url: &str, id: &str) -> Re
     let url = format!("{}/api/services/{}/restart", api_url, id);
     let resp = client.post(&url).send().await.context("Failed to connect to daemon")?;
     if resp.status().is_success() {
-        println!("{} Service '{}' restarted.", "✓".green().bold(), id.cyan());
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if body.get("adopted").and_then(|v| v.as_bool()).unwrap_or(false) {
+            print_adopted_banner(id, &body);
+        } else {
+            let msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("restarted successfully");
+            println!("{} Service '{}': {}", "✓".green().bold(), id.cyan(), msg.green());
+        }
     } else {
         let err_text = resp.text().await?;
-        eprintln!("{} Failed to restart service: {}", "✗".red().bold(), err_text);
+        print_conflict_error_banner(id, &err_text);
     }
     Ok(())
+}
+
+fn print_adopted_banner(id: &str, body: &serde_json::Value) {
+    let outcome = body.get("outcome");
+    let pid = outcome
+        .and_then(|o| o.get("pid"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let host = outcome
+        .and_then(|o| o.get("host"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("127.0.0.1");
+    let port = outcome
+        .and_then(|o| o.get("port"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let is_udp = outcome
+        .and_then(|o| o.get("is_udp"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let exe = outcome
+        .and_then(|o| o.get("exe"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let proto = if is_udp { "UDP" } else { "TCP" };
+
+    println!();
+    println!("{}", "╭─ ℹ LEFTOVER PROCESS ADOPTED ────────────────────────────────────╮".cyan().bold());
+    println!("{}  Service:        {:<50} {}", "│".cyan().bold(), id.white().bold(), "│".cyan().bold());
+    println!("{}  Adopted PID:    {:<50} {}", "│".cyan().bold(), pid.to_string().green().bold(), "│".cyan().bold());
+    if port > 0 {
+        let port_display = format!("{host}:{port} ({proto})");
+        println!("{}  Target Port:    {:<50} {}", "│".cyan().bold(), port_display.yellow().bold(), "│".cyan().bold());
+    }
+    if !exe.is_empty() {
+        let exe_display = if exe.len() > 50 { &exe[..47] } else { exe };
+        println!("{}  Executable:     {:<50} {}", "│".cyan().bold(), exe_display.dimmed(), "│".cyan().bold());
+    }
+    println!("{}  Status:         {:<50} {}", "│".cyan().bold(), "Attached existing process safely (no restart)".green(), "│".cyan().bold());
+    println!("{}", "╰─────────────────────────────────────────────────────────────────╯".cyan().bold());
+    println!();
+}
+
+fn print_conflict_error_banner(id: &str, err_text: &str) {
+    println!();
+    println!("{}", "╭─ ✖ PORT OCCUPIED / START REFUSED ───────────────────────────────╮".red().bold());
+    println!("{}  Service:    {:<54} {}", "│".red().bold(), id.white().bold(), "│".red().bold());
+    for line in err_text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            println!("{}  {:<58} {}", "│".red().bold(), trimmed.bright_red(), "│".red().bold());
+        }
+    }
+    println!("{}  Action:     {:<54} {}", "│".red().bold(), "Stop foreign PID or change target port in config".yellow(), "│".red().bold());
+    println!("{}", "╰─────────────────────────────────────────────────────────────────╯".red().bold());
+    println!();
 }
 
 async fn handle_test(client: &reqwest::Client, api_url: &str, id: &str) -> Result<()> {

@@ -1,4 +1,6 @@
-use super::adopt::{find_adoptable_pid, AdoptLookup};
+use super::adopt::{
+    find_adoptable_pid_proto, process_exe_matches, process_is_alive, AdoptLookup,
+};
 use super::probe::{run_probe, ProbeResult};
 use super::process::{stop_pid, PollExit, ProcessHandle};
 use crate::config::{
@@ -7,6 +9,7 @@ use crate::config::{
 use crate::drivers::get_driver;
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +18,31 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StartOutcome {
+    Spawned {
+        pid: u32,
+    },
+    Adopted {
+        pid: u32,
+        host: String,
+        port: u16,
+        is_udp: bool,
+        exe: String,
+    },
+    AlreadyRunning {
+        pid: u32,
+    },
+}
+
+struct AdoptedTarget {
+    pid: u32,
+    host: String,
+    port: u16,
+    is_udp: bool,
+}
 
 #[derive(Clone)]
 pub struct ServiceManager {
@@ -96,7 +124,7 @@ impl ServiceManager {
             .collect()
     }
 
-    pub async fn start_service(&self, id: &str) -> Result<()> {
+    pub async fn start_service(&self, id: &str) -> Result<StartOutcome> {
         let instance = self
             .store
             .get(id)
@@ -108,7 +136,7 @@ impl ServiceManager {
             if let Some(handle) = handles.get_mut(id) {
                 if handle.is_running() {
                     info!("Service '{}' is already running (PID {})", id, handle.pid);
-                    return Ok(());
+                    return Ok(StartOutcome::AlreadyRunning { pid: handle.pid });
                 }
                 handles.remove(id);
             }
@@ -116,6 +144,11 @@ impl ServiceManager {
 
         let driver = get_driver(instance.service_type);
         let config_dir = self.store.get_service_config_dir(id);
+
+        driver
+            .prepare_config(&instance, &config_dir)
+            .context("Failed to prepare service configuration files")?;
+
         let expected_exe = {
             let cmd = driver
                 .build_command(&instance, &config_dir)
@@ -125,47 +158,123 @@ impl ServiceManager {
         let log_file = self.store.get_log_file_path(id);
         let persisted = self.store.get_runtime(id).await;
 
-        match find_adoptable_pid(
-            persisted.as_ref(),
-            &expected_exe,
-            &instance.listen_host,
-            instance.listen_port,
-        ) {
-            AdoptLookup::Found(pid) => {
-                let owns_process_group = persisted
-                    .as_ref()
-                    .filter(|rt| rt.pid == pid)
-                    .map(|rt| rt.owns_process_group)
-                    .unwrap_or(false);
-                let handle = ProcessHandle::adopt(
-                    id.to_string(),
-                    pid,
-                    owns_process_group,
-                    log_file,
-                );
-                self.handles.write().await.insert(id.to_string(), handle);
-                self.persist_runtime(&instance, pid, owns_process_group, &expected_exe)
-                    .await;
-                self.mark_running(id, pid).await;
-                info!("Adopted leftover process for service '{}' (PID {})", id, pid);
-                return Ok(());
+        let target_ports = driver.get_target_ports(&instance, &config_dir);
+        let mut adopted_info: Option<AdoptedTarget> = None;
+
+        for target in &target_ports {
+            match find_adoptable_pid_proto(
+                persisted.as_ref(),
+                &expected_exe,
+                &target.host,
+                target.port,
+                target.is_udp,
+            ) {
+                AdoptLookup::Found(pid) => {
+                    adopted_info = Some(AdoptedTarget {
+                        pid,
+                        host: target.host.clone(),
+                        port: target.port,
+                        is_udp: target.is_udp,
+                    });
+                }
+                AdoptLookup::PortBusy { pid, exe } => {
+                    let proto_str = if target.is_udp { "UDP" } else { "TCP" };
+                    let foreign_exe = exe.as_deref().unwrap_or("unknown");
+                    let port_desc = format!("{}:{} ({proto_str})", target.host, target.port);
+                    let occ_desc = format!("{pid} ({foreign_exe})");
+                    let exp_desc = format!("{}", expected_exe.display());
+                    warn!(
+                        "\n╭─ ✖ PORT CONFLICT ERROR ──────────────────────────────────────╮\n\
+                         │ Service:         {id:<42} │\n\
+                         │ Target Port:     {port_desc:<42} │\n\
+                         │ Occupied By PID: {occ_desc:<42} │\n\
+                         │ Expected Binary: {exp_desc:<42} │\n\
+                         │ Cause:           Port opened by another process             │\n\
+                         ╰─────────────────────────────────────────────────────────────╯"
+                    );
+                    anyhow::bail!(
+                        "Target port {}:{} ({proto_str}) from configuration file is already in use by PID {pid} ({foreign_exe}) — not adopting (executable does not match {})",
+                        target.host,
+                        target.port,
+                        expected_exe.display()
+                    );
+                }
+                AdoptLookup::None => {}
             }
-            AdoptLookup::PortBusy { pid, exe } => {
-                anyhow::bail!(
-                    "Listen address {}:{} is already in use by PID {}{} — not adopting (executable does not match {})",
-                    instance.listen_host,
-                    instance.listen_port,
-                    pid,
-                    exe.map(|e| format!(" ({e})")).unwrap_or_default(),
-                    expected_exe.display()
-                );
-            }
-            AdoptLookup::None => {}
         }
 
-        driver
-            .prepare_config(&instance, &config_dir)
-            .context("Failed to prepare service configuration files")?;
+        if let Some(adopted) = adopted_info {
+            let owns_process_group = persisted
+                .as_ref()
+                .filter(|rt| rt.pid == adopted.pid)
+                .map(|rt| rt.owns_process_group)
+                .unwrap_or(false);
+            let handle = ProcessHandle::adopt(
+                id.to_string(),
+                adopted.pid,
+                owns_process_group,
+                log_file,
+            );
+            self.handles.write().await.insert(id.to_string(), handle);
+            self.persist_runtime(&instance, adopted.pid, owns_process_group, &expected_exe)
+                .await;
+            self.mark_running(id, adopted.pid).await;
+
+            let proto_str = if adopted.is_udp { "UDP" } else { "TCP" };
+            let pid_str = format!("{}", adopted.pid);
+            let port_str = format!("{}:{} ({proto_str})", adopted.host, adopted.port);
+            let exe_str = format!("{}", expected_exe.display());
+            info!(
+                "\n╭─ ℹ PROCESS ADOPTED ──────────────────────────────────────────╮\n\
+                 │ Service:     {id:<46} │\n\
+                 │ Adopted PID: {pid_str:<46} │\n\
+                 │ Target Port: {port_str:<46} │\n\
+                 │ Executable:  {exe_str:<46} │\n\
+                 │ Status:      Attached running instance successfully          │\n\
+                 ╰─────────────────────────────────────────────────────────────╯"
+            );
+            return Ok(StartOutcome::Adopted {
+                pid: adopted.pid,
+                host: adopted.host,
+                port: adopted.port,
+                is_udp: adopted.is_udp,
+                exe: expected_exe.display().to_string(),
+            });
+        }
+
+        if target_ports.is_empty() {
+            if let Some(rt) = persisted.as_ref() {
+                if process_is_alive(rt.pid) && process_exe_matches(rt.pid, &expected_exe) {
+                    let handle = ProcessHandle::adopt(
+                        id.to_string(),
+                        rt.pid,
+                        rt.owns_process_group,
+                        log_file,
+                    );
+                    self.handles.write().await.insert(id.to_string(), handle);
+                    self.persist_runtime(&instance, rt.pid, rt.owns_process_group, &expected_exe)
+                        .await;
+                    self.mark_running(id, rt.pid).await;
+                    let pid_str = format!("{}", rt.pid);
+                    let exe_str = format!("{}", expected_exe.display());
+                    info!(
+                        "\n╭─ ℹ PROCESS ADOPTED ──────────────────────────────────────────╮\n\
+                         │ Service:     {id:<46} │\n\
+                         │ Adopted PID: {pid_str:<46} │\n\
+                         │ Executable:  {exe_str:<46} │\n\
+                         │ Status:      Attached running instance successfully          │\n\
+                         ╰─────────────────────────────────────────────────────────────╯"
+                    );
+                    return Ok(StartOutcome::Adopted {
+                        pid: rt.pid,
+                        host: instance.listen_host.clone(),
+                        port: instance.listen_port,
+                        is_udp: false,
+                        exe: expected_exe.display().to_string(),
+                    });
+                }
+            }
+        }
 
         let cmd = driver
             .build_command(&instance, &config_dir)
@@ -180,7 +289,7 @@ impl ServiceManager {
             .await;
         self.mark_running(id, pid).await;
         info!("Started service '{}' (PID {})", id, pid);
-        Ok(())
+        Ok(StartOutcome::Spawned { pid })
     }
 
     pub async fn stop_service(&self, id: &str) -> Result<()> {
@@ -259,7 +368,7 @@ impl ServiceManager {
         let _ = self.event_sender.send(state);
     }
 
-    pub async fn restart_service(&self, id: &str) -> Result<()> {
+    pub async fn restart_service(&self, id: &str) -> Result<StartOutcome> {
         info!("Restarting service '{}'", id);
         let _ = self.stop_service(id).await;
         sleep(Duration::from_millis(200)).await;
@@ -429,7 +538,7 @@ impl ServiceManager {
                     }
 
                     match self_clone.start_service(&inst_id).await {
-                        Ok(()) => {
+                        Ok(_) => {
                             info!("Auto-restart of service '{}' succeeded", inst_id);
                             return;
                         }

@@ -17,12 +17,33 @@ pub fn find_adoptable_pid(
     listen_host: &str,
     listen_port: u16,
 ) -> AdoptLookup {
+    find_adoptable_pid_proto(persisted, expected_exe, listen_host, listen_port, false)
+}
+
+pub fn find_adoptable_pid_proto(
+    persisted: Option<&PersistedRuntime>,
+    expected_exe: &Path,
+    listen_host: &str,
+    listen_port: u16,
+    is_udp: bool,
+) -> AdoptLookup {
     if let Some(rt) = persisted {
         if process_is_alive(rt.pid) {
             match process_info(rt.pid) {
                 Some((exe, name, cmd))
                     if exe_matches(expected_exe, exe.as_deref(), &name, &cmd) =>
                 {
+                    if listen_port > 0 {
+                        let listeners = find_listening_pids_proto(listen_host, listen_port, is_udp);
+                        if let Some(&other_pid) = listeners.first() {
+                            if other_pid != rt.pid && !process_exe_matches(other_pid, expected_exe) {
+                                return AdoptLookup::PortBusy {
+                                    pid: other_pid,
+                                    exe: process_exe_display(other_pid),
+                                };
+                            }
+                        }
+                    }
                     return AdoptLookup::Found(rt.pid);
                 }
                 None => {
@@ -34,7 +55,7 @@ pub fn find_adoptable_pid(
         }
     }
 
-    let listeners = find_listening_pids(listen_host, listen_port);
+    let listeners = find_listening_pids_proto(listen_host, listen_port, is_udp);
     for pid in &listeners {
         if process_exe_matches(*pid, expected_exe) {
             return AdoptLookup::Found(*pid);
@@ -95,18 +116,22 @@ pub fn process_exe_display(pid: u32) -> Option<String> {
 }
 
 pub fn find_listening_pids(host: &str, port: u16) -> Vec<u32> {
+    find_listening_pids_proto(host, port, false)
+}
+
+pub fn find_listening_pids_proto(host: &str, port: u16, check_udp: bool) -> Vec<u32> {
     if port == 0 {
         return Vec::new();
     }
 
-    let mut pids = find_listening_pids_lsof(Some(host), port);
+    let mut pids = find_listening_pids_lsof(Some(host), port, check_udp);
     if pids.is_empty() {
-        pids = find_listening_pids_lsof(None, port);
+        pids = find_listening_pids_lsof(None, port, check_udp);
     }
 
     #[cfg(target_os = "linux")]
     if pids.is_empty() {
-        pids = find_listening_pids_proc(port);
+        pids = find_listening_pids_proc(port, check_udp);
     }
 
     pids.sort_unstable();
@@ -182,16 +207,32 @@ fn stem_matches(expected: &str, actual: &str) -> bool {
     false
 }
 
-fn find_listening_pids_lsof(host: Option<&str>, port: u16) -> Vec<u32> {
+fn find_listening_pids_lsof(host: Option<&str>, port: u16, check_udp: bool) -> Vec<u32> {
     let spec = match host {
         Some(h) if !h.is_empty() && h != "0.0.0.0" && h != "::" && h != "*" => {
-            format!("-iTCP@{h}:{port}")
+            if check_udp {
+                format!("-iUDP@{h}:{port}")
+            } else {
+                format!("-iTCP@{h}:{port}")
+            }
         }
-        _ => format!("-iTCP:{port}"),
+        _ => {
+            if check_udp {
+                format!("-iUDP:{port}")
+            } else {
+                format!("-iTCP:{port}")
+            }
+        }
     };
 
+    let mut args = vec!["-nP", "-t"];
+    if !check_udp {
+        args.push("-sTCP:LISTEN");
+    }
+    args.push(&spec);
+
     let output = std::process::Command::new("lsof")
-        .args(["-nP", "-t", "-sTCP:LISTEN", &spec])
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -216,10 +257,15 @@ fn parse_pid_lines(stdout: &[u8]) -> Vec<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn find_listening_pids_proc(port: u16) -> Vec<u32> {
+fn find_listening_pids_proc(port: u16, check_udp: bool) -> Vec<u32> {
     let mut inodes = Vec::new();
-    collect_listen_inodes("/proc/net/tcp", port, &mut inodes);
-    collect_listen_inodes("/proc/net/tcp6", port, &mut inodes);
+    if check_udp {
+        collect_udp_inodes("/proc/net/udp", port, &mut inodes);
+        collect_udp_inodes("/proc/net/udp6", port, &mut inodes);
+    } else {
+        collect_listen_inodes("/proc/net/tcp", port, &mut inodes);
+        collect_listen_inodes("/proc/net/tcp6", port, &mut inodes);
+    }
     if inodes.is_empty() {
         return Vec::new();
     }
@@ -271,6 +317,31 @@ fn collect_listen_inodes(path: &str, port: u16, inodes: &mut Vec<u64>) {
         }
         // local_address is ip:port in hex; st 0A = LISTEN
         if cols[3] != "0A" {
+            continue;
+        }
+        let Some((_, hex_port)) = cols[1].rsplit_once(':') else {
+            continue;
+        };
+        let Ok(p) = u16::from_str_radix(hex_port, 16) else {
+            continue;
+        };
+        if p != port {
+            continue;
+        }
+        if let Ok(inode) = cols[9].parse::<u64>() {
+            inodes.push(inode);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_udp_inodes(path: &str, port: u16, inodes: &mut Vec<u64>) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in content.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 10 {
             continue;
         }
         let Some((_, hex_port)) = cols[1].rsplit_once(':') else {
